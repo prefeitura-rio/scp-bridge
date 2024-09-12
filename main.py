@@ -44,36 +44,44 @@ class FileHandler(FileSystemEventHandler):
 
     def check_and_upload(self, file_path: str) -> None:
         logger.info(f"Checking file {file_path}")
-        if self.is_file_stable(file_path):
-            self.upload_to_gcs(file_path)
-        else:
-            logger.info(f"  * File {file_path} is not stable yet. Skipping.")
+        try:
+            if self.is_file_stable(file_path):
+                self.upload_to_gcs(file_path)
+            else:
+                logger.info(f"  * File {file_path} is not stable yet. Skipping.")
+        except FileNotFoundError:
+            logger.warning(f"  * File {file_path} was not found. It may have been deleted or moved.")
+            self._file_status.pop(Path(file_path), None)
 
     def is_file_stable(self, file_path: str | Path) -> bool:
         """
         Check if the file is stable by comparing size and timestamp.
         """
         file_path = Path(file_path)
-        file_size = file_path.stat().st_size
-        now = pendulum.now(tz=TIMEZONE)
-        if file_path not in self._file_status:
-            self._file_status[file_path] = FileStatus(
-                size=file_size, timestamp=now.timestamp()
-            )
-        else:
-            last_status = self._file_status[file_path]
-            if last_status.size == file_size:
-                last_status_timestamp = pendulum.from_timestamp(
-                    last_status.timestamp, tz=TIMEZONE
-                )
-                diff = now.diff(last_status_timestamp).in_seconds()
-                if diff >= STABLE_TIME:
-                    return True
-            else:
+        try:
+            file_size = file_path.stat().st_size
+            now = pendulum.now(tz=TIMEZONE)
+            if file_path not in self._file_status:
                 self._file_status[file_path] = FileStatus(
                     size=file_size, timestamp=now.timestamp()
                 )
-        return False
+            else:
+                last_status = self._file_status[file_path]
+                if last_status.size == file_size:
+                    last_status_timestamp = pendulum.from_timestamp(
+                        last_status.timestamp, tz=TIMEZONE
+                    )
+                    diff = now.diff(last_status_timestamp).in_seconds()
+                    if diff >= STABLE_TIME:
+                        return True
+                else:
+                    self._file_status[file_path] = FileStatus(
+                        size=file_size, timestamp=now.timestamp()
+                    )
+            return False
+        except FileNotFoundError:
+            logger.warning(f"  * File {file_path} was not found during stability check.")
+            return False
 
     def upload_to_gcs(self, file_path: str | Path) -> None:
         """
@@ -94,10 +102,22 @@ class FileHandler(FileSystemEventHandler):
             logger.error(f"  * Error uploading file {file_path} to GCS: {e}")
 
 
+def scan_existing_files(handler: FileHandler, directory: str) -> None:
+    """Scan the directory for existing files and process them."""
+    for path in Path(directory).rglob('*'):
+        if path.is_file():
+            logger.info(f"Processing existing file: {path}")
+            handler.check_and_upload(str(path))
+
+
 if __name__ == "__main__":
     event_handler = FileHandler()
     observer = Observer()
     observer.schedule(event_handler, path=WATCH_DIR, recursive=True)
+    
+    # Scan for existing files before starting the observer
+    scan_existing_files(event_handler, WATCH_DIR)
+    
     observer.start()
     logger.info(f"Watching directory {WATCH_DIR} for changes")
     try:
